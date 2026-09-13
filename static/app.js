@@ -51,9 +51,10 @@ async function loadConfig() {
 }
 
 async function setupDiscord(clientId) {
-  // Fora do Discord (teste no browser): modo demo local.
-  const inDiscord = window.parent !== window || /Discord/.test(navigator.userAgent);
-  if (!inDiscord && !window.location.search.includes("forceDiscord")) {
+  const params = new URLSearchParams(window.location.search);
+  const inDiscord = params.has("frame_id") && params.has("instance_id");
+
+  if (!inDiscord) {
     els.title.textContent = "Modo demo local";
     roomId = "demo-local";
     setStatus("Pronto para testar fora do Discord");
