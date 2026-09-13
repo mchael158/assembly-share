@@ -8,6 +8,7 @@ const PRESETS = {
 
 const PACKET_WEBCODECS = 1;
 const PACKET_MEDIARECORDER = 2;
+const PACKET_JPEG = 3;
 
 const els = {
   title: document.getElementById("title"),
@@ -45,7 +46,11 @@ let publishMode = null; // "webcodecs" | "mediarecorder"
 let mediaSource = null;
 let sourceBuffer = null;
 let mrQueue = [];
+let pendingPackets = [];
 let mrMime = "";
+let jpegTimer = null;
+let viewerReady = false;
+let lastJpegUrl = null;
 
 function setStatus(text, hideOverlay = false) {
   els.status.textContent = text;
@@ -176,6 +181,15 @@ function refreshActivityButton() {
   }
 }
 
+function roomFromDiscordParams(params) {
+  const instanceId = params.get("instance_id");
+  const channelId = params.get("channel_id");
+  const guildId = params.get("guild_id");
+  if (channelId) return `${guildId || "dm"}:${channelId}`;
+  if (instanceId) return `instance:${instanceId}`;
+  return null;
+}
+
 async function setupDiscord(clientId) {
   const params = new URLSearchParams(window.location.search);
   const inDiscord =
@@ -183,11 +197,17 @@ async function setupDiscord(clientId) {
 
   if (!inDiscord) {
     const roomParam = params.get("room");
+    const keyParam = params.get("key");
     if (roomParam) {
       mode = "publisher";
       roomId = roomParam;
-      publishKey = params.get("key");
+      publishKey = keyParam && keyParam !== "null" ? keyParam : null;
       els.title.textContent = "Transmissor Assembly Share";
+      if (!publishKey || roomId === "local-demo") {
+        setStatus("Link inválido. Feche esta aba, reabra a Activity no Discord e use o botão de transmitir.");
+        els.mainBtn.disabled = true;
+        return;
+      }
       setStatus("Clique abaixo e escolha o que transmitir (tela, janela ou aba).");
       els.mainBtn.disabled = false;
       els.mainBtn.textContent = "Escolher o que transmitir";
@@ -206,38 +226,34 @@ async function setupDiscord(clientId) {
   }
 
   mode = "activity";
-  setStatus("Conectando ao Discord…");
-  discordSdk = new DiscordSDK(clientId);
-  await discordSdk.ready();
-
-  setStatus("Autorize o Assembly na janela do Discord, se aparecer…");
-  const authz = await discordSdk.commands.authorize({
-    client_id: clientId,
-    response_type: "code",
-    state: "",
-    prompt: "none",
-    scope: ["identify", "guilds", "applications.commands"],
-  });
-  const code = authz.code || authz?.data?.code;
-  if (!code) throw new Error("Authorize não retornou code");
-
-  setStatus("Validando sessão…");
-  const tokenRes = await activityFetch("/api/activity/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code }),
-  });
-
-  const { access_token } = await tokenRes.json();
-  auth = await discordSdk.commands.authenticate({ access_token });
-
-  const channelId = discordSdk.channelId || "unknown";
-  const guildId = discordSdk.guildId || "dm";
-  roomId = `${guildId}:${channelId}`;
+  roomId = roomFromDiscordParams(params) || "local-demo";
   publishKey = getOrCreatePublishKey();
   els.title.textContent = "Assembly Share";
   setStatus("Conectando à sala…");
   connectWs();
+  refreshActivityButton();
+
+  try {
+    setStatus("Conectando ao Discord…");
+    discordSdk = new DiscordSDK(clientId);
+    await discordSdk.ready();
+    if (discordSdk.channelId || discordSdk.guildId) {
+      const nextRoom = `${discordSdk.guildId || "dm"}:${discordSdk.channelId || "unknown"}`;
+      if (nextRoom !== roomId && discordSdk.channelId) {
+        roomId = nextRoom;
+        publishKey = getOrCreatePublishKey();
+        if (ws) {
+          try { ws.close(); } catch {}
+          ws = null;
+        }
+        connectWs();
+      }
+    }
+  } catch (e) {
+    console.warn("SDK Discord opcional falhou; sala já está conectada:", e);
+  }
+
+  setStatus("Ninguém transmitindo. Toque no botão para abrir o transmissor.");
   refreshActivityButton();
 }
 
@@ -299,6 +315,7 @@ function connectWs() {
         }
       } else if (msg.t === "config" && !publishing) {
         await ensureViewer(msg);
+        await flushPendingPackets();
       } else if (msg.t === "ended" && !publishing) {
         teardownViewer();
         setStatus("Transmissão encerrada");
@@ -312,6 +329,13 @@ function connectWs() {
     }
 
     if (publishing) return;
+    if (!viewerReady && !decoder && !sourceBuffer) {
+      if (pendingPackets.length < 240) pendingPackets.push(ev.data);
+      // JPEG pode pintar mesmo antes do config.
+      const kind = new DataView(ev.data).getUint8(0);
+      if (kind === PACKET_JPEG) await handleJpegPacket(ev.data);
+      return;
+    }
     await handleVideoPacket(ev.data);
   };
 }
@@ -457,6 +481,7 @@ async function startWebCodecsPublish(cfg) {
 
   await encoder.configure(encConfig);
   sendJson({ t: "publish", key: publishKey });
+  startJpegFallback(cfg.width, cfg.height);
 
   const interval = Math.max(16, Math.floor(1000 / cfg.framerate));
   let frameNo = 0;
@@ -526,6 +551,7 @@ async function startMediaRecorderPublish(preset) {
     videoBitsPerSecond: bitrate,
   });
 
+  sendJson({ t: "publish", key: publishKey });
   sendJson({
     t: "config",
     mode: "mediarecorder",
@@ -533,7 +559,7 @@ async function startMediaRecorderPublish(preset) {
     codedWidth: preset.width,
     codedHeight: preset.height,
   });
-  sendJson({ t: "publish", key: publishKey });
+  startJpegFallback(preset.width, preset.height);
 
   mediaRecorder.ondataavailable = async (ev) => {
     if (!ev.data || ev.data.size === 0) return;
@@ -561,6 +587,8 @@ async function startMediaRecorderPublish(preset) {
 }
 
 function teardownViewer() {
+  viewerReady = false;
+  pendingPackets = [];
   if (decoder) {
     try {
       decoder.close();
@@ -575,6 +603,10 @@ function teardownViewer() {
   }
   sourceBuffer = null;
   mrQueue = [];
+  if (lastJpegUrl) {
+    try { URL.revokeObjectURL(lastJpegUrl); } catch {}
+    lastJpegUrl = null;
+  }
   if (els.remote.src) {
     try {
       URL.revokeObjectURL(els.remote.src);
@@ -584,19 +616,45 @@ function teardownViewer() {
   }
 }
 
+function ensureJpegCanvas(width, height) {
+  els.preview.hidden = true;
+  els.remote.hidden = true;
+  els.view.hidden = false;
+  if (width) els.view.width = width;
+  if (height) els.view.height = height;
+  if (!els.view.width) els.view.width = 1280;
+  if (!els.view.height) els.view.height = 720;
+}
+
 async function ensureViewer(cfg) {
   teardownViewer();
   els.preview.hidden = true;
+
+  if (cfg.mode === "jpeg" || (cfg.mode === "mediarecorder" && !window.MediaSource)) {
+    ensureJpegCanvas(cfg.codedWidth, cfg.codedHeight);
+    viewerReady = true;
+    setStatus("Recebendo stream…", true);
+    return;
+  }
 
   if (cfg.mode === "mediarecorder") {
     els.view.hidden = true;
     els.remote.hidden = false;
     await ensureMediaRecorderViewer(cfg);
+    viewerReady = true;
     return;
   }
   els.remote.hidden = true;
   els.view.hidden = false;
-  await ensureWebCodecsViewer(cfg);
+  try {
+    await ensureWebCodecsViewer(cfg);
+    viewerReady = true;
+  } catch (e) {
+    console.warn(e);
+    ensureJpegCanvas(cfg.codedWidth, cfg.codedHeight);
+    viewerReady = true;
+    setStatus("Decoder indisponível · usando JPEG", true);
+  }
 }
 
 async function ensureMediaRecorderViewer(cfg) {
@@ -679,9 +737,81 @@ async function ensureWebCodecsViewer(cfg) {
   setStatus("Recebendo stream…", true);
 }
 
+function startJpegFallback(srcW, srcH) {
+  if (jpegTimer) clearInterval(jpegTimer);
+  const w = Math.min(srcW || 1280, 1280);
+  const h = Math.min(srcH || 720, 720);
+  const jpegCanvas = document.createElement("canvas");
+  jpegCanvas.width = w;
+  jpegCanvas.height = h;
+  const jctx = jpegCanvas.getContext("2d", { alpha: false, desynchronized: true });
+
+  jpegTimer = setInterval(() => {
+    if (!publishing || !els.preview || els.preview.readyState < 2) return;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    try {
+      jctx.drawImage(els.preview, 0, 0, w, h);
+      jpegCanvas.toBlob(
+        async (blob) => {
+          if (!blob || ws?.readyState !== WebSocket.OPEN) return;
+          const ab = await blob.arrayBuffer();
+          const buf = new ArrayBuffer(1 + ab.byteLength);
+          const out = new Uint8Array(buf);
+          out[0] = PACKET_JPEG;
+          out.set(new Uint8Array(ab), 1);
+          ws.send(buf);
+        },
+        "image/jpeg",
+        0.62
+      );
+    } catch (e) {
+      console.warn(e);
+    }
+  }, 120);
+}
+
+async function handleJpegPacket(buffer) {
+  const blob = new Blob([buffer.slice(1)], { type: "image/jpeg" });
+  try {
+    const bmp = await createImageBitmap(blob);
+    ensureJpegCanvas(bmp.width, bmp.height);
+    const vctx = els.view.getContext("2d", { alpha: false, desynchronized: true });
+    vctx.drawImage(bmp, 0, 0, els.view.width, els.view.height);
+    bmp.close();
+    els.overlay.classList.add("hidden");
+    viewerReady = true;
+  } catch {
+    if (lastJpegUrl) {
+      try { URL.revokeObjectURL(lastJpegUrl); } catch {}
+    }
+    lastJpegUrl = URL.createObjectURL(blob);
+    ensureJpegCanvas();
+    const img = new Image();
+    img.onload = () => {
+      const vctx = els.view.getContext("2d", { alpha: false, desynchronized: true });
+      vctx.drawImage(img, 0, 0, els.view.width, els.view.height);
+      els.overlay.classList.add("hidden");
+      viewerReady = true;
+    };
+    img.src = lastJpegUrl;
+  }
+}
+
+async function flushPendingPackets() {
+  const queued = pendingPackets.splice(0);
+  for (const pkt of queued) {
+    await handleVideoPacket(pkt);
+  }
+}
+
 async function handleVideoPacket(buffer) {
   const view = new DataView(buffer);
   const kind = view.getUint8(0);
+
+  if (kind === PACKET_JPEG) {
+    await handleJpegPacket(buffer);
+    return;
+  }
 
   if (kind === PACKET_MEDIARECORDER) {
     const data = buffer.slice(1);
@@ -718,6 +848,10 @@ async function stopPublish() {
   if (frameTimer) {
     clearInterval(frameTimer);
     frameTimer = null;
+  }
+  if (jpegTimer) {
+    clearInterval(jpegTimer);
+    jpegTimer = null;
   }
   if (mediaRecorder) {
     try {
