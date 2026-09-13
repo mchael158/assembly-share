@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Assembly Share — Transmissor</title>
+  <link rel="stylesheet" href="static/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div>
+        <p class="brand">ASSEMBLY SHARE</p>
+        <h1 id="title">Transmissor</h1>
+      </div>
+      <div class="meta" id="meta">—</div>
+    </header>
+    <section class="stage">
+      <video id="preview" autoplay playsinline muted></video>
+      <video id="remote" autoplay playsinline muted hidden></video>
+      <canvas id="view" hidden></canvas>
+      <div class="overlay" id="overlay">
+        <p id="status">Carregando transmissor…</p>
+      </div>
+    </section>
+    <section class="controls">
+      <button id="mainBtn" class="primary" disabled>Aguarde</button>
+      <p class="hint" id="publishHint" hidden></p>
+    </section>
+  </main>
+  <script type="module" src="static/bootstrap.js?v=024"></script>
+</body>
+</html>

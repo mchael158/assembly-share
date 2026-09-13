@@ -21,6 +21,8 @@ const els = {
   mainBtn: document.getElementById("mainBtn"),
   quality: document.getElementById("quality"),
   publishHint: document.getElementById("publishHint"),
+  publisherLink: document.getElementById("publisherLink"),
+  copyLinkBtn: document.getElementById("copyLinkBtn"),
 };
 
 let discordSdk = null;
@@ -147,13 +149,28 @@ async function loadConfig() {
 
 // Página do transmissor externo: hospedada no GitHub Pages (evita bloqueios de
 // antivírus no domínio compartilhado da Discloud). API/WS continuam na Discloud.
-const PUBLISHER_ORIGIN = "https://mchael158.github.io/assembly-share/";
+const PUBLISHER_ORIGIN = "https://mchael158.github.io/assembly-share/publish.html";
 
 function publisherUrl() {
   const u = new URL(PUBLISHER_ORIGIN);
   u.searchParams.set("room", roomId);
   u.searchParams.set("key", publishKey || "");
   return u.toString();
+}
+
+function showPublisherLink() {
+  const url = publisherUrl();
+  if (els.publisherLink) {
+    els.publisherLink.href = url;
+    els.publisherLink.hidden = false;
+    els.publisherLink.textContent = "Abrir transmissor no Chrome";
+  }
+  if (els.copyLinkBtn) els.copyLinkBtn.hidden = false;
+  if (els.mainBtn) els.mainBtn.hidden = true;
+  if (els.publishHint) {
+    els.publishHint.hidden = false;
+    els.publishHint.textContent = url;
+  }
 }
 
 function getOrCreatePublishKey() {
@@ -173,12 +190,19 @@ function getOrCreatePublishKey() {
 
 function refreshActivityButton() {
   if (mode !== "activity") return;
-  if (roomLive) {
-    els.mainBtn.disabled = true;
-    els.mainBtn.textContent = "AO VIVO · pare pela aba do navegador";
-  } else {
-    els.mainBtn.disabled = false;
-    els.mainBtn.textContent = "Transmitir tela (abre no navegador)";
+  if (!publishKey || roomId === "local-demo") {
+    if (els.publisherLink) els.publisherLink.hidden = true;
+    if (els.copyLinkBtn) els.copyLinkBtn.hidden = true;
+    if (els.mainBtn) {
+      els.mainBtn.hidden = false;
+      els.mainBtn.disabled = true;
+      els.mainBtn.textContent = "Aguardando sala do Discord…";
+    }
+    return;
+  }
+  showPublisherLink();
+  if (roomLive && els.publisherLink) {
+    els.publisherLink.textContent = "AO VIVO · reabrir transmissor";
   }
 }
 
@@ -269,33 +293,14 @@ async function setupDiscord(clientId) {
   refreshActivityButton();
 }
 
-async function openExternalPublisher() {
-  if (!publishKey || roomId === "local-demo") {
-    setStatus("A conexão com o Discord não foi concluída. Toque em Tentar novamente.");
-    els.mainBtn.textContent = "Tentar novamente";
-    els.mainBtn.onclick = () => location.reload();
-    return;
-  }
+async function copyPublisherLink() {
   const url = publisherUrl();
-  if (els.publishHint) {
-    els.publishHint.hidden = false;
-    els.publishHint.innerHTML = `Abra no Chrome/Edge:<br><a href="${url}" target="_blank" rel="noopener">${url}</a>`;
-  }
-  setStatus("Abrindo o transmissor no navegador… se não abrir, use o link abaixo.");
   try {
     await navigator.clipboard.writeText(url);
-  } catch {}
-  if (discordSdk?.commands?.openExternalLink) {
-    try {
-      await discordSdk.commands.openExternalLink({ url });
-      return;
-    } catch (e) {
-      console.warn(e);
-    }
+    setStatus("Link copiado. Cole na barra do Chrome — não use assembly.discloud.app");
+  } catch {
+    setStatus(url);
   }
-  try {
-    window.open(url, "_blank", "noopener");
-  } catch {}
 }
 
 function wsUrl() {
@@ -915,10 +920,14 @@ function base64ToBuffer(b64) {
   return out.buffer;
 }
 
+if (els.copyLinkBtn) {
+  els.copyLinkBtn.addEventListener("click", () => copyPublisherLink());
+}
+
 els.mainBtn.addEventListener("click", async () => {
   try {
     if (mode === "activity") {
-      await openExternalPublisher();
+      await copyPublisherLink();
       return;
     }
     if (publishing) await stopPublish();
