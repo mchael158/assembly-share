@@ -24,6 +24,7 @@ const els = {
   publishHint: document.getElementById("publishHint"),
   publisherLink: document.getElementById("publisherLink"),
   copyLinkBtn: document.getElementById("copyLinkBtn"),
+  liveBadge: document.getElementById("liveBadge"),
 };
 
 let discordSdk = null;
@@ -55,6 +56,8 @@ let mrMime = "";
 let jpegTimer = null;
 let viewerReady = false;
 let lastJpegUrl = null;
+let framePoll = null;
+let wsUrlIndex = 0;
 
 function setStatus(text, hideOverlay = false) {
   els.status.textContent = text;
@@ -63,6 +66,11 @@ function setStatus(text, hideOverlay = false) {
 
 function setMeta(text) {
   els.meta.textContent = text;
+}
+
+function setLiveLook(on) {
+  document.body.classList.toggle("is-live", !!on);
+  if (els.liveBadge) els.liveBadge.hidden = !on;
 }
 
 function currentPreset() {
@@ -92,7 +100,8 @@ function backendHttpBase() {
 function backendWsBase() {
   if (inDiscordActivity()) {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    return `${proto}//${location.host}/backend`;
+    // Padrão Foxy/discord-screen: tudo que sai do iframe passa por /.proxy/
+    return `${proto}//${location.host}/.proxy/backend`;
   }
   if (location.hostname === BACKEND_HOST) {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -225,11 +234,12 @@ function refreshActivityButton() {
 }
 
 function roomFromDiscordParams(params) {
+  // Foxy/discord-screen: a sala é a instância da Activity, não o canal.
   const instanceId = params.get("instance_id");
+  if (instanceId) return `instance:${instanceId}`;
   const channelId = params.get("channel_id");
   const guildId = params.get("guild_id");
   if (channelId) return `${guildId || "dm"}:${channelId}`;
-  if (instanceId) return `instance:${instanceId}`;
   return null;
 }
 
@@ -253,7 +263,7 @@ async function setupDiscord(clientId) {
         els.mainBtn.textContent = "Entendi, fechar esta página";
         els.mainBtn.onclick = () => {
           try { window.close(); } catch {}
-          location.href = PUBLISHER_ORIGIN;
+          location.href = PUBLISHER_PAGE;
         };
         if (els.publishHint) {
           els.publishHint.hidden = false;
@@ -285,24 +295,22 @@ async function setupDiscord(clientId) {
   els.title.textContent = "Assembly Share";
   setStatus("Conectando à sala…");
   connectWs();
+  startFramePoll();
   refreshActivityButton();
 
   try {
     setStatus("Conectando ao Discord…");
     discordSdk = new DiscordSDK(clientId);
     await discordSdk.ready();
-    if (discordSdk.channelId || discordSdk.guildId) {
-      const nextRoom = `${discordSdk.guildId || "dm"}:${discordSdk.channelId || "unknown"}`;
-      if (nextRoom !== roomId && discordSdk.channelId) {
-        roomId = nextRoom;
-        publishKey = getOrCreatePublishKey();
-        if (ws) {
-          try { ws.close(); } catch {}
-          ws = null;
-        }
-        connectWs();
-      }
-    }
+    try {
+      await discordSdk.commands.setActivity({
+        activity: {
+          type: 1,
+          details: "Assembly Share",
+          state: "Na call",
+        },
+      });
+    } catch {}
   } catch (e) {
     console.warn("SDK Discord opcional falhou; sala já está conectada:", e);
   }
@@ -322,7 +330,16 @@ async function copyPublisherLink() {
 }
 
 function wsUrl() {
-  return `${backendWsBase()}/ws/share?room=${encodeURIComponent(roomId)}`;
+  const room = encodeURIComponent(roomId);
+  if (inDiscordActivity()) {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const candidates = [
+      `${proto}//${location.host}/.proxy/backend/ws/share?room=${room}`,
+      `${proto}//${location.host}/backend/ws/share?room=${room}`,
+    ];
+    return candidates[wsUrlIndex % candidates.length];
+  }
+  return `${backendWsBase()}/ws/share?room=${room}`;
 }
 
 function connectWs() {
@@ -333,12 +350,14 @@ function connectWs() {
   ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
-    setMeta(`Sala ${roomId}`);
+    setMeta(mode === "activity" ? "Na Activity · conectado" : `Sala ${roomId}`);
     if (mode === "activity" && publishKey) {
       sendJson({ t: "claim", key: publishKey });
+      sendJson({ t: "watch" });
     }
   };
   ws.onclose = () => {
+    wsUrlIndex += 1;
     setMeta("Reconectando…");
     setTimeout(connectWs, 1200);
   };
@@ -347,9 +366,16 @@ function connectWs() {
       const msg = JSON.parse(ev.data);
       if (msg.t === "roster") {
         roomLive = !!msg.live;
-        setMeta(`${msg.live ? "AO VIVO" : "Aguardando"} · ${msg.viewers} na sala`);
+        setMeta(`${msg.live ? "AO VIVO · transmitindo" : "Aguardando"} · ${msg.viewers} na sala`);
+        if (mode === "activity") setLiveLook(!!msg.live && viewerReady);
+        if (mode === "activity" && msg.live && discordSdk?.commands?.setActivity) {
+          discordSdk.commands.setActivity({
+            activity: { type: 0, details: "Transmitindo tela", state: "AO VIVO" },
+          }).catch(() => {});
+        }
         refreshActivityButton();
         if (!publishing && !msg.live) {
+          setLiveLook(false);
           setStatus(
             mode === "activity"
               ? "Ninguém transmitindo. Use o botão para abrir o transmissor."
@@ -793,15 +819,46 @@ async function ensureWebCodecsViewer(cfg) {
   setStatus("Recebendo stream…", true);
 }
 
-function showJpegFrame(b64) {
-  if (!b64 || publishing) return;
-  const url = `data:image/jpeg;base64,${b64}`;
+function paintJpegUrl(url) {
   if (els.remoteJpeg) {
     els.preview.hidden = true;
     els.remote.hidden = true;
     els.view.hidden = true;
     els.remoteJpeg.hidden = false;
+    const prev = els.remoteJpeg.getAttribute("data-blob");
     els.remoteJpeg.src = url;
+    if (url.startsWith("blob:")) els.remoteJpeg.setAttribute("data-blob", url);
+    if (prev && prev.startsWith("blob:") && prev !== url) {
+      try { URL.revokeObjectURL(prev); } catch {}
+    }
+  }
+  els.overlay.classList.add("hidden");
+  viewerReady = true;
+  if (mode === "activity") setLiveLook(true);
+}
+
+function startFramePoll() {
+  if (framePoll || mode !== "activity") return;
+  framePoll = setInterval(async () => {
+    if (publishing || !roomId || roomId === "local-demo") return;
+    try {
+      const res = await activityFetch(
+        `/api/activity/frame?room=${encodeURIComponent(roomId)}`
+      );
+      if (res.status === 204 || !res.ok) return;
+      const blob = await res.blob();
+      if (!blob || blob.size < 40) return;
+      const url = URL.createObjectURL(blob);
+      paintJpegUrl(url);
+    } catch {}
+  }, 180);
+}
+
+function showJpegFrame(b64) {
+  if (!b64 || publishing) return;
+  const url = `data:image/jpeg;base64,${b64}`;
+  if (els.remoteJpeg) {
+    paintJpegUrl(url);
   } else {
     const img = new Image();
     img.onload = () => {
@@ -817,8 +874,8 @@ function showJpegFrame(b64) {
 
 function startJpegFallback(srcW, srcH) {
   if (jpegTimer) clearInterval(jpegTimer);
-  const w = Math.min(srcW || 960, 960);
-  const h = Math.min(srcH || 540, 540);
+  const w = Math.min(srcW || 640, 640);
+  const h = Math.min(srcH || 360, 360);
   const jpegCanvas = document.createElement("canvas");
   jpegCanvas.width = w;
   jpegCanvas.height = h;
@@ -833,15 +890,29 @@ function startJpegFallback(srcW, srcH) {
 
   jpegTimer = setInterval(() => {
     if (!publishing || !els.preview || els.preview.readyState < 2) return;
-    if (ws?.readyState !== WebSocket.OPEN) return;
     try {
       jctx.drawImage(els.preview, 0, 0, w, h);
-      const data = jpegCanvas.toDataURL("image/jpeg", 0.55).split(",")[1];
-      if (data) sendJson({ t: "jpeg", data });
+      jpegCanvas.toBlob(
+        async (blob) => {
+          if (!blob) return;
+          const url = `${backendHttpBase()}/api/activity/frame?room=${encodeURIComponent(roomId)}&key=${encodeURIComponent(publishKey || "")}`;
+          try {
+            await fetch(url, {
+              method: "POST",
+              headers: { "content-type": "image/jpeg" },
+              body: blob,
+            });
+          } catch (e) {
+            console.warn(e);
+          }
+        },
+        "image/jpeg",
+        0.45
+      );
     } catch (e) {
       console.warn(e);
     }
-  }, 140);
+  }, 160);
 }
 
 async function handleJpegPacket(buffer) {

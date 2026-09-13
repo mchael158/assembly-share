@@ -46,6 +46,7 @@ export class DiscordSDK {
       authorize: (args) => this.#command("AUTHORIZE", args),
       authenticate: (args) => this.#command("AUTHENTICATE", args),
       openExternalLink: (args) => this.#command("OPEN_EXTERNAL_LINK", args),
+      setActivity: (args) => this.#command("SET_ACTIVITY", args),
     };
 
     this.#send([

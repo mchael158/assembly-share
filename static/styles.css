@@ -95,6 +95,45 @@ video, canvas, #remoteJpeg {
 
 .overlay.hidden { display: none; }
 
+.live-badge {
+  position: absolute;
+  z-index: 3;
+  top: 12px;
+  left: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.28rem 0.65rem;
+  border-radius: 999px;
+  background: #e22d4c;
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  box-shadow: 0 0 0 0 rgba(226, 45, 76, 0.55);
+  animation: livepulse 1.4s ease-out infinite;
+}
+
+.live-badge[hidden] { display: none; }
+
+.live-badge::before {
+  content: "";
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: #fff;
+}
+
+@keyframes livepulse {
+  0% { box-shadow: 0 0 0 0 rgba(226, 45, 76, 0.5); }
+  70% { box-shadow: 0 0 0 10px rgba(226, 45, 76, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(226, 45, 76, 0); }
+}
+
+body.is-live .stage {
+  border-color: #e22d4c;
+}
+
 .controls {
   display: grid;
   gap: 0.85rem;
