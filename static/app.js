@@ -61,6 +61,30 @@ function inDiscordActivity() {
   );
 }
 
+// Backend (API + WebSocket) sempre na Discloud.
+// - Dentro do Discord: proxy path mapping `/backend` -> assembly.discloud.app
+// - Servido pela própria Discloud: mesma origem
+// - Servido de outro host estático (GitHub Pages): URL absoluta + CORS
+const BACKEND_HOST = "assembly.discloud.app";
+
+function backendHttpBase() {
+  if (inDiscordActivity()) return "/backend";
+  if (location.hostname === BACKEND_HOST) return "";
+  return `https://${BACKEND_HOST}`;
+}
+
+function backendWsBase() {
+  if (inDiscordActivity()) {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${location.host}/backend`;
+  }
+  if (location.hostname === BACKEND_HOST) {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${location.host}`;
+  }
+  return `wss://${BACKEND_HOST}`;
+}
+
 function webCodecsAvailable() {
   return (
     typeof VideoEncoder !== "undefined" &&
@@ -71,21 +95,34 @@ function webCodecsAvailable() {
 }
 
 async function activityFetch(path, init) {
+  const base = backendHttpBase();
   const attempts = inDiscordActivity()
-    ? [`/.proxy${path}`, path]
-    : [path, `/.proxy${path}`];
+    ? [`${base}${path}`, `/.proxy${base}${path}`]
+    : [`${base}${path}`];
+  let lastErr = null;
   for (const url of attempts) {
     try {
       const res = await fetch(url, init);
       if (res.ok) return res;
-    } catch {}
+      lastErr = new Error(`HTTP ${res.status} em ${url}`);
+    } catch (e) {
+      lastErr = e;
+    }
   }
-  return fetch(attempts[0], init);
+  throw lastErr || new Error("Backend indisponível");
 }
 
 async function loadConfig() {
-  const res = await activityFetch("/api/activity/config");
-  if (!res.ok) throw new Error("Activity sem DISCORD_CLIENT_ID no servidor");
+  let res;
+  try {
+    res = await activityFetch("/api/activity/config");
+  } catch (e) {
+    throw new Error(
+      inDiscordActivity()
+        ? "Backend não alcançado. No Developer Portal, adicione o mapeamento /backend → assembly.discloud.app"
+        : `Backend indisponível: ${e.message || e}`
+    );
+  }
   return res.json();
 }
 
@@ -123,10 +160,6 @@ async function setupDiscord(clientId) {
     body: JSON.stringify({ code }),
   });
 
-  if (!tokenRes.ok) {
-    const err = await tokenRes.json().catch(() => ({}));
-    throw new Error(err.error || "Falha no token OAuth");
-  }
   const { access_token } = await tokenRes.json();
   auth = await discordSdk.commands.authenticate({ access_token });
 
@@ -141,8 +174,7 @@ async function setupDiscord(clientId) {
 }
 
 function wsUrl() {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}/ws/share?room=${encodeURIComponent(roomId)}`;
+  return `${backendWsBase()}/ws/share?room=${encodeURIComponent(roomId)}`;
 }
 
 function connectWs() {
