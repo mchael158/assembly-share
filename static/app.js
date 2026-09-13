@@ -1,4 +1,4 @@
-import { DiscordSDK } from "https://esm.sh/@discord/embedded-app-sdk@1.9.3";
+import { DiscordSDK } from "./discord-sdk.js";
 
 const PRESETS = {
   ultra: { width: 1920, height: 1080, fps: 60, bitrate: 12_000_000, label: "Ultra 1080p60" },
@@ -66,25 +66,30 @@ async function setupDiscord(clientId) {
   discordSdk = new DiscordSDK(clientId);
   await discordSdk.ready();
 
-  const { code } = await discordSdk.commands.authorize({
+  const authz = await discordSdk.commands.authorize({
     client_id: clientId,
     response_type: "code",
     state: "",
     prompt: "none",
     scope: ["identify", "guilds", "applications.commands"],
   });
+  const code = authz.code || authz?.data?.code;
+  if (!code) throw new Error("Authorize não retornou code");
 
-  const tokenRes = await fetch("/.proxy/api/activity/token", {
+  // Preferir proxy do Discord; fallback mesma origem (browser).
+  let tokenRes = await fetch("/.proxy/api/activity/token", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ code }),
-  }).catch(async () =>
-    fetch("/api/activity/token", {
+  }).catch(() => null);
+
+  if (!tokenRes || !tokenRes.ok) {
+    tokenRes = await fetch("/api/activity/token", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code }),
-    })
-  );
+    });
+  }
 
   if (!tokenRes.ok) {
     const err = await tokenRes.json().catch(() => ({}));
