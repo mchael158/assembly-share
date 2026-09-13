@@ -6,12 +6,16 @@ const PRESETS = {
   balanced: { width: 1280, height: 720, fps: 30, bitrate: 4_000_000, label: "720p30" },
 };
 
+const PACKET_WEBCODECS = 1;
+const PACKET_MEDIARECORDER = 2;
+
 const els = {
   title: document.getElementById("title"),
   meta: document.getElementById("meta"),
   status: document.getElementById("status"),
   overlay: document.getElementById("overlay"),
   preview: document.getElementById("preview"),
+  remote: document.getElementById("remote"),
   view: document.getElementById("view"),
   mainBtn: document.getElementById("mainBtn"),
   quality: document.getElementById("quality"),
@@ -26,10 +30,16 @@ let mediaStream = null;
 let videoTrack = null;
 let encoder = null;
 let decoder = null;
+let mediaRecorder = null;
 let frameTimer = null;
 let canvas = null;
 let ctx2d = null;
 let encoderConfigSent = false;
+let publishMode = null; // "webcodecs" | "mediarecorder"
+let mediaSource = null;
+let sourceBuffer = null;
+let mrQueue = [];
+let mrMime = "";
 
 function setStatus(text, hideOverlay = false) {
   els.status.textContent = text;
@@ -48,6 +58,15 @@ function inDiscordActivity() {
   return (
     location.hostname.endsWith(".discordsays.com") ||
     new URLSearchParams(location.search).has("frame_id")
+  );
+}
+
+function webCodecsAvailable() {
+  return (
+    typeof VideoEncoder !== "undefined" &&
+    typeof VideoDecoder !== "undefined" &&
+    typeof VideoFrame !== "undefined" &&
+    typeof EncodedVideoChunk !== "undefined"
   );
 }
 
@@ -146,19 +165,18 @@ function connectWs() {
         if (!publishing && !msg.live) {
           setStatus("Ninguém transmitindo. Toque para começar.");
           els.preview.hidden = true;
+          els.remote.hidden = true;
           els.view.hidden = true;
           els.overlay.classList.remove("hidden");
         }
       } else if (msg.t === "config" && !publishing) {
-        await ensureDecoder(msg);
+        await ensureViewer(msg);
       } else if (msg.t === "ended" && !publishing) {
+        teardownViewer();
         setStatus("Transmissão encerrada");
+        els.remote.hidden = true;
         els.view.hidden = true;
         els.overlay.classList.remove("hidden");
-        if (decoder) {
-          try { decoder.close(); } catch {}
-          decoder = null;
-        }
       } else if (msg.t === "error") {
         setStatus(msg.message || "Erro");
       }
@@ -174,27 +192,44 @@ function sendJson(obj) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
-async function pickCodec() {
+function pickMediaRecorderMime() {
   const candidates = [
-    "avc1.640028", // H.264 High@4.0
-    "avc1.42E01F",
-    "vp09.00.10.08",
-    "vp8",
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm",
+    "video/mp4",
   ];
-  for (const codec of candidates) {
+  for (const mime of candidates) {
+    if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mime)) {
+      return mime;
+    }
+  }
+  return null;
+}
+
+async function pickWebCodecsCodec(preset) {
+  if (!webCodecsAvailable()) return null;
+
+  const candidates = [
+    { codec: "vp8", width: Math.min(preset.width, 1280), height: Math.min(preset.height, 720), bitrate: Math.min(preset.bitrate, 4_000_000), framerate: Math.min(preset.fps, 30) },
+    { codec: "vp09.00.10.08", width: Math.min(preset.width, 1280), height: Math.min(preset.height, 720), bitrate: Math.min(preset.bitrate, 4_000_000), framerate: Math.min(preset.fps, 30) },
+    { codec: "avc1.42E01F", width: Math.min(preset.width, 1280), height: Math.min(preset.height, 720), bitrate: Math.min(preset.bitrate, 4_000_000), framerate: Math.min(preset.fps, 30), avc: { format: "annexb" } },
+    { codec: "avc1.640028", width: preset.width, height: preset.height, bitrate: preset.bitrate, framerate: Math.min(preset.fps, 60), avc: { format: "annexb" } },
+  ];
+
+  for (const cfg of candidates) {
     try {
       const support = await VideoEncoder.isConfigSupported({
-        codec,
-        width: 1280,
-        height: 720,
-        bitrate: 4_000_000,
-        framerate: 30,
-        avc: { format: "annexb" },
+        ...cfg,
+        latencyMode: "realtime",
+        hardwareAcceleration: "no-preference",
       });
-      if (support.supported) return codec;
+      if (support.supported) {
+        return { ...cfg, ...(support.config || {}) };
+      }
     } catch {}
   }
-  throw new Error("WebCodecs VideoEncoder indisponível neste cliente");
+  return null;
 }
 
 async function startPublish() {
@@ -203,7 +238,7 @@ async function startPublish() {
     video: {
       width: { ideal: preset.width },
       height: { ideal: preset.height },
-      frameRate: { ideal: preset.fps, max: preset.fps },
+      frameRate: { ideal: Math.min(preset.fps, 30), max: preset.fps },
     },
     audio: false,
   });
@@ -216,32 +251,60 @@ async function startPublish() {
   els.view.hidden = true;
   els.overlay.classList.add("hidden");
 
-  canvas = document.createElement("canvas");
-  canvas.width = preset.width;
-  canvas.height = preset.height;
-  ctx2d = canvas.getContext("2d", { alpha: false, desynchronized: true });
+  const wc = await pickWebCodecsCodec(preset);
+  if (wc) {
+    try {
+      await startWebCodecsPublish(wc);
+      return;
+    } catch (e) {
+      console.warn("WebCodecs falhou, tentando MediaRecorder:", e);
+      await cleanupEncoderOnly();
+    }
+  }
 
-  const codec = await pickCodec();
+  await startMediaRecorderPublish(preset);
+}
+
+async function cleanupEncoderOnly() {
+  if (frameTimer) {
+    clearInterval(frameTimer);
+    frameTimer = null;
+  }
+  if (encoder) {
+    try {
+      encoder.close();
+    } catch {}
+    encoder = null;
+  }
+}
+
+async function startWebCodecsPublish(cfg) {
+  publishMode = "webcodecs";
   encoderConfigSent = false;
+
+  canvas = document.createElement("canvas");
+  canvas.width = cfg.width;
+  canvas.height = cfg.height;
+  ctx2d = canvas.getContext("2d", { alpha: false, desynchronized: true });
 
   encoder = new VideoEncoder({
     output: (chunk, meta) => {
       if (!encoderConfigSent) {
-        const cfg = {
+        sendJson({
           t: "config",
-          codec,
-          codedWidth: preset.width,
-          codedHeight: preset.height,
+          mode: "webcodecs",
+          codec: cfg.codec,
+          codedWidth: cfg.width,
+          codedHeight: cfg.height,
           description: meta?.decoderConfig?.description
             ? bufferToBase64(meta.decoderConfig.description)
             : null,
-        };
-        sendJson(cfg);
+        });
         encoderConfigSent = true;
       }
       const buf = new ArrayBuffer(10 + chunk.byteLength);
       const view = new DataView(buf);
-      view.setUint8(0, 1);
+      view.setUint8(0, PACKET_WEBCODECS);
       view.setUint8(1, chunk.type === "key" ? 1 : 0);
       view.setBigUint64(2, BigInt(chunk.timestamp), true);
       chunk.copyTo(new Uint8Array(buf, 10));
@@ -254,45 +317,60 @@ async function startPublish() {
   });
 
   const encConfig = {
-    codec,
-    width: preset.width,
-    height: preset.height,
-    bitrate: preset.bitrate,
-    framerate: preset.fps,
+    codec: cfg.codec,
+    width: cfg.width,
+    height: cfg.height,
+    bitrate: cfg.bitrate,
+    framerate: cfg.framerate,
     latencyMode: "realtime",
-    hardwareAcceleration: "prefer-hardware",
-    avc: { format: "annexb" },
+    hardwareAcceleration: "no-preference",
   };
-  // VP9/VP8 não usam avc
-  if (!codec.startsWith("avc")) delete encConfig.avc;
+  if (cfg.avc) encConfig.avc = cfg.avc;
 
   await encoder.configure(encConfig);
   sendJson({ t: "publish" });
 
-  const interval = Math.max(8, Math.floor(1000 / preset.fps));
+  const interval = Math.max(16, Math.floor(1000 / cfg.framerate));
   let frameNo = 0;
+  let encoding = false;
+
   frameTimer = setInterval(async () => {
-    if (!encoder || encoder.state === "closed") return;
-    const bmp = await createImageBitmap(videoTrack);
+    if (!encoder || encoder.state !== "configured" || encoding) return;
+    if (encoder.encodeQueueSize > 2) return;
+    encoding = true;
     try {
-      // letterbox para manter aspecto sem distorcer
-      ctx2d.fillStyle = "#000";
-      ctx2d.fillRect(0, 0, canvas.width, canvas.height);
-      const scale = Math.min(canvas.width / bmp.width, canvas.height / bmp.height);
-      const w = bmp.width * scale;
-      const h = bmp.height * scale;
-      const x = (canvas.width - w) / 2;
-      const y = (canvas.height - h) / 2;
-      ctx2d.drawImage(bmp, x, y, w, h);
-      const frame = new VideoFrame(canvas, {
-        timestamp: frameNo * (1_000_000 / preset.fps),
-      });
-      const keyFrame = frameNo % (preset.fps * 1) === 0;
-      encoder.encode(frame, { keyFrame });
-      frame.close();
-      frameNo += 1;
+      let bmp;
+      try {
+        bmp = await createImageBitmap(videoTrack);
+      } catch {
+        bmp = await createImageBitmap(els.preview);
+      }
+      try {
+        ctx2d.fillStyle = "#000";
+        ctx2d.fillRect(0, 0, canvas.width, canvas.height);
+        const scale = Math.min(canvas.width / bmp.width, canvas.height / bmp.height);
+        const w = bmp.width * scale;
+        const h = bmp.height * scale;
+        const x = (canvas.width - w) / 2;
+        const y = (canvas.height - h) / 2;
+        ctx2d.drawImage(bmp, x, y, w, h);
+        const frame = new VideoFrame(canvas, {
+          timestamp: frameNo * (1_000_000 / cfg.framerate),
+        });
+        const keyFrame = frameNo % Math.max(1, cfg.framerate) === 0;
+        encoder.encode(frame, { keyFrame });
+        frame.close();
+        frameNo += 1;
+      } finally {
+        bmp.close();
+      }
+    } catch (e) {
+      console.error(e);
+      setStatus(`Encoder: ${e.message || e}`);
+      clearInterval(frameTimer);
+      frameTimer = null;
     } finally {
-      bmp.close();
+      encoding = false;
     }
   }, interval);
 
@@ -300,15 +378,151 @@ async function startPublish() {
   els.mainBtn.textContent = "Parar transmissão";
   els.mainBtn.classList.add("live");
   els.quality.disabled = true;
-  setStatus(`${preset.label} · transmitindo`, true);
+  setStatus(`${cfg.codec} · ${cfg.width}x${cfg.height}@${cfg.framerate} · WebCodecs`, true);
 }
 
-async function ensureDecoder(cfg) {
-  if (decoder) {
-    try { decoder.close(); } catch {}
+async function startMediaRecorderPublish(preset) {
+  const mime = pickMediaRecorderMime();
+  if (!mime) {
+    throw new Error(
+      "Este navegador não suporta WebCodecs nem MediaRecorder. Use Chrome/Edge (ou Discord desktop)."
+    );
   }
-  els.view.hidden = false;
+
+  publishMode = "mediarecorder";
+  mrMime = mime;
+
+  const bitrate = Math.min(preset.bitrate, 6_000_000);
+  mediaRecorder = new MediaRecorder(mediaStream, {
+    mimeType: mime,
+    videoBitsPerSecond: bitrate,
+  });
+
+  sendJson({
+    t: "config",
+    mode: "mediarecorder",
+    mime,
+    codedWidth: preset.width,
+    codedHeight: preset.height,
+  });
+  sendJson({ t: "publish" });
+
+  mediaRecorder.ondataavailable = async (ev) => {
+    if (!ev.data || ev.data.size === 0) return;
+    const ab = await ev.data.arrayBuffer();
+    const buf = new ArrayBuffer(1 + ab.byteLength);
+    const out = new Uint8Array(buf);
+    out[0] = PACKET_MEDIARECORDER;
+    out.set(new Uint8Array(ab), 1);
+    if (ws?.readyState === WebSocket.OPEN) ws.send(buf);
+  };
+
+  mediaRecorder.onerror = (e) => {
+    console.error(e);
+    setStatus(`MediaRecorder: ${e.error?.message || "erro"}`);
+  };
+
+  // timeslice curto = latência menor
+  mediaRecorder.start(250);
+
+  publishing = true;
+  els.mainBtn.textContent = "Parar transmissão";
+  els.mainBtn.classList.add("live");
+  els.quality.disabled = true;
+  setStatus(`MediaRecorder · ${mime} (compatível)`, true);
+}
+
+function teardownViewer() {
+  if (decoder) {
+    try {
+      decoder.close();
+    } catch {}
+    decoder = null;
+  }
+  if (mediaSource) {
+    try {
+      if (mediaSource.readyState === "open") mediaSource.endOfStream();
+    } catch {}
+    mediaSource = null;
+  }
+  sourceBuffer = null;
+  mrQueue = [];
+  if (els.remote.src) {
+    try {
+      URL.revokeObjectURL(els.remote.src);
+    } catch {}
+    els.remote.removeAttribute("src");
+    els.remote.load();
+  }
+}
+
+async function ensureViewer(cfg) {
+  teardownViewer();
   els.preview.hidden = true;
+
+  if (cfg.mode === "mediarecorder") {
+    els.view.hidden = true;
+    els.remote.hidden = false;
+    await ensureMediaRecorderViewer(cfg);
+    return;
+  }
+  els.remote.hidden = true;
+  els.view.hidden = false;
+  await ensureWebCodecsViewer(cfg);
+}
+
+async function ensureMediaRecorderViewer(cfg) {
+  mrMime = cfg.mime || "video/webm;codecs=vp8";
+  if (!window.MediaSource) {
+    setStatus("MediaSource indisponível para receber o stream");
+    return;
+  }
+
+  mediaSource = new MediaSource();
+  els.remote.src = URL.createObjectURL(mediaSource);
+  els.remote.muted = true;
+  els.remote.playsInline = true;
+
+  await new Promise((resolve, reject) => {
+    mediaSource.addEventListener("sourceopen", resolve, { once: true });
+    mediaSource.addEventListener("error", reject, { once: true });
+  });
+
+  try {
+    sourceBuffer = mediaSource.addSourceBuffer(mrMime);
+  } catch (e) {
+    try {
+      sourceBuffer = mediaSource.addSourceBuffer("video/webm;codecs=vp8");
+      mrMime = "video/webm;codecs=vp8";
+    } catch (e2) {
+      setStatus(`Viewer MSE: ${e2.message || e.message}`);
+      return;
+    }
+  }
+
+  sourceBuffer.mode = "sequence";
+  sourceBuffer.addEventListener("updateend", flushMrQueue);
+  setStatus("Recebendo stream (MediaRecorder)…", true);
+  els.remote.play().catch(() => {});
+}
+
+function flushMrQueue() {
+  if (!sourceBuffer || sourceBuffer.updating || !mrQueue.length) return;
+  const next = mrQueue.shift();
+  try {
+    sourceBuffer.appendBuffer(next);
+    els.overlay.classList.add("hidden");
+  } catch (e) {
+    console.warn(e);
+  }
+}
+
+async function ensureWebCodecsViewer(cfg) {
+  if (!webCodecsAvailable()) {
+    setStatus("WebCodecs indisponível neste cliente para assistir");
+    return;
+  }
+
   const vctx = els.view.getContext("2d", { alpha: false, desynchronized: true });
   els.view.width = cfg.codedWidth || 1920;
   els.view.height = cfg.codedHeight || 1080;
@@ -338,9 +552,19 @@ async function ensureDecoder(cfg) {
 }
 
 async function handleVideoPacket(buffer) {
-  if (!decoder || decoder.state === "closed") return;
   const view = new DataView(buffer);
-  if (view.getUint8(0) !== 1) return;
+  const kind = view.getUint8(0);
+
+  if (kind === PACKET_MEDIARECORDER) {
+    const data = buffer.slice(1);
+    mrQueue.push(data);
+    flushMrQueue();
+    return;
+  }
+
+  if (kind !== PACKET_WEBCODECS) return;
+  if (!decoder || decoder.state === "closed") return;
+
   const key = view.getUint8(1) === 1;
   const ts = Number(view.getBigUint64(2, true));
   const data = new Uint8Array(buffer, 10);
@@ -367,6 +591,12 @@ async function stopPublish() {
     clearInterval(frameTimer);
     frameTimer = null;
   }
+  if (mediaRecorder) {
+    try {
+      if (mediaRecorder.state !== "inactive") mediaRecorder.stop();
+    } catch {}
+    mediaRecorder = null;
+  }
   if (encoder) {
     try {
       await encoder.flush();
@@ -378,6 +608,7 @@ async function stopPublish() {
     mediaStream.getTracks().forEach((t) => t.stop());
     mediaStream = null;
   }
+  publishMode = null;
   els.preview.srcObject = null;
   els.preview.hidden = true;
   setStatus("Transmissão parada");
@@ -406,6 +637,9 @@ els.mainBtn.addEventListener("click", async () => {
     console.error(e);
     setStatus(e.message || String(e));
     els.overlay.classList.remove("hidden");
+    try {
+      await stopPublish();
+    } catch {}
   }
 });
 
@@ -417,7 +651,6 @@ els.mainBtn.addEventListener("click", async () => {
     console.error(e);
     els.title.textContent = "Assembly Share";
     setStatus(e.message || String(e));
-    // Ainda permite demo local se config falhar parcialmente
     els.mainBtn.disabled = false;
     els.mainBtn.textContent = "Transmitir tela";
     connectWs();
