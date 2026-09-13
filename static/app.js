@@ -65,7 +65,8 @@ function setMeta(text) {
 }
 
 function currentPreset() {
-  return PRESETS[els.quality.value] || PRESETS.ultra;
+  const value = els.quality?.value || "ultra";
+  return PRESETS[value] || PRESETS.ultra;
 }
 
 function inDiscordActivity() {
@@ -149,10 +150,26 @@ async function loadConfig() {
 
 // Página do transmissor externo: hospedada no GitHub Pages (evita bloqueios de
 // antivírus no domínio compartilhado da Discloud). API/WS continuam na Discloud.
-const PUBLISHER_ORIGIN = "https://mchael158.github.io/assembly-share/publish.html";
+const PUBLISHER_PAGE = "https://mchael158.github.io/assembly-share/publish.html";
+
+function bounceOffDiscloudIfPublisher() {
+  const params = new URLSearchParams(location.search);
+  const room = params.get("room");
+  const key = params.get("key");
+  const inFrame =
+    location.hostname.endsWith(".discordsays.com") || params.has("frame_id");
+  if (inFrame) return;
+  if (location.hostname !== BACKEND_HOST) return;
+  if (!room || !key || key === "null" || room === "local-demo") return;
+  location.replace(`${PUBLISHER_PAGE}?${params.toString()}`);
+}
+
+bounceOffDiscloudIfPublisher();
 
 function publisherUrl() {
-  const u = new URL(PUBLISHER_ORIGIN);
+  // Discord intercepta github.io e abre a Discloud. O /go da Discloud
+  // redireciona de volta ao Pages depois que o navegador já saiu do iframe.
+  const u = new URL(`https://${BACKEND_HOST}/go`);
   u.searchParams.set("room", roomId);
   u.searchParams.set("key", publishKey || "");
   return u.toString();
@@ -334,8 +351,10 @@ function connectWs() {
         if (!publishing && !msg.live) {
           setStatus(
             mode === "activity"
-              ? "Ninguém transmitindo. Toque no botão para abrir o transmissor."
-              : "Ninguém transmitindo. Toque para começar."
+              ? "Ninguém transmitindo. Use o botão para abrir o transmissor."
+              : mode === "publisher"
+                ? "Clique abaixo e escolha o que transmitir (tela, janela ou aba)."
+                : "Ninguém transmitindo. Toque para começar."
           );
           els.preview.hidden = true;
           els.remote.hidden = true;
@@ -559,7 +578,7 @@ async function startWebCodecsPublish(cfg) {
   publishing = true;
   els.mainBtn.textContent = "Parar transmissão";
   els.mainBtn.classList.add("live");
-  els.quality.disabled = true;
+  if (els.quality) els.quality.disabled = true;
   setStatus(`${cfg.codec} · ${cfg.width}x${cfg.height}@${cfg.framerate} · WebCodecs`, true);
 }
 
@@ -611,7 +630,7 @@ async function startMediaRecorderPublish(preset) {
   publishing = true;
   els.mainBtn.textContent = "Parar transmissão";
   els.mainBtn.classList.add("live");
-  els.quality.disabled = true;
+  if (els.quality) els.quality.disabled = true;
   setStatus(`MediaRecorder · ${mime} (compatível)`, true);
 }
 
@@ -871,7 +890,7 @@ async function stopPublish() {
   publishing = false;
   els.mainBtn.classList.remove("live");
   els.mainBtn.textContent = "Transmitir tela";
-  els.quality.disabled = false;
+  if (els.quality) els.quality.disabled = false;
   sendJson({ t: "unpublish" });
 
   if (frameTimer) {
