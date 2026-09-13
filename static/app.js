@@ -123,8 +123,7 @@ async function setupDiscord(clientId) {
 
 function wsUrl() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const prefix = inDiscordActivity() ? "/.proxy" : "";
-  return `${proto}//${location.host}${prefix}/ws/share?room=${encodeURIComponent(roomId)}`;
+  return `${proto}//${location.host}/ws/share?room=${encodeURIComponent(roomId)}`;
 }
 
 function connectWs() {
