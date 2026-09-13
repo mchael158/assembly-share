@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Assembly Share</title>
+  <link rel="stylesheet" href="/activity/static/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div>
+        <p class="brand">ASSEMBLY SHARE</p>
+        <h1 id="title">Preparando…</h1>
+      </div>
+      <div class="meta" id="meta">—</div>
+    </header>
+
+    <section class="stage">
+      <video id="preview" autoplay playsinline muted></video>
+      <canvas id="view" hidden></canvas>
+      <div class="overlay" id="overlay">
+        <p id="status">Conectando ao Discord…</p>
+      </div>
+    </section>
+
+    <section class="controls">
+      <button id="mainBtn" class="primary" disabled>Aguarde</button>
+      <details class="advanced">
+        <summary>Qualidade</summary>
+        <label>
+          Preset
+          <select id="quality">
+            <option value="ultra" selected>Ultra · 1080p60 · 12 Mbps</option>
+            <option value="high">Alta · 1080p30 · 8 Mbps</option>
+            <option value="balanced">Equilibrada · 720p30 · 4 Mbps</option>
+          </select>
+        </label>
+        <p class="hint">Padrão já é superior à maioria das Activities. Só mude se a rede pedir.</p>
+      </details>
+    </section>
+  </main>
+
+  <script type="module" src="/activity/static/app.js"></script>
+</body>
+</html>
