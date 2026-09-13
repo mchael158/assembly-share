@@ -1,9 +1,167 @@
 /**
  * SDK mínimo Embedded App (postMessage RPC) — servido na mesma origem.
- * Suficiente para authorize/authenticate/ready sem CDN externo.
+ * Inclui patchUrlMappings para o sandbox do Discord (discordsays.com).
  */
 
 const Opcodes = { HANDSHAKE: 0, FRAME: 1, CLOSE: 2, HELLO: 3 };
+const SUBSTITUTION_REGEX = /\{([a-z]+)\}/g;
+
+function absoluteURL(url, protocol = location.protocol, host = location.host) {
+  return new URL(url, `${protocol}//${host}`);
+}
+
+function regexFromTarget(target) {
+  const regexString = target.replace(SUBSTITUTION_REGEX, (_, name) => `(?<${name}>[\\w-]+)`);
+  return new RegExp(`${regexString}(/|$)`);
+}
+
+function matchAndRewriteURL({ originalURL, prefix, prefixHost, target }) {
+  const targetURL = new URL(`https://${target}`);
+  const targetRegEx = regexFromTarget(
+    targetURL.host.replace(/%7B/g, "{").replace(/%7D/g, "}")
+  );
+  const match = originalURL.toString().match(targetRegEx);
+  if (match == null) return originalURL;
+
+  const newURL = new URL(originalURL.toString());
+  newURL.host = prefixHost;
+  newURL.pathname = prefix.replace(SUBSTITUTION_REGEX, (_, matchName) => {
+    const replaceValue = match.groups?.[matchName];
+    if (replaceValue == null) throw new Error("Misconfigured route.");
+    return replaceValue;
+  });
+
+  const pathToAppend = originalURL.pathname.startsWith("/")
+    ? originalURL.pathname.slice(1)
+    : originalURL.pathname;
+  newURL.pathname += newURL.pathname.endsWith("/") ? pathToAppend : `/${pathToAppend}`;
+  newURL.pathname = newURL.pathname.replace(targetURL.pathname, "");
+  if (originalURL.pathname.endsWith("/") && !newURL.pathname.endsWith("/")) {
+    newURL.pathname += "/";
+  }
+  return newURL;
+}
+
+export function attemptRemap({ url, mappings }) {
+  const newURL = new URL(url.toString());
+  for (const mapping of mappings) {
+    const mapped = matchAndRewriteURL({
+      originalURL: newURL,
+      prefix: mapping.prefix,
+      target: mapping.target,
+      prefixHost: location.host,
+    });
+    if (mapped != null && mapped.toString() !== url.toString()) {
+      return mapped;
+    }
+  }
+  return newURL;
+}
+
+function attemptRecreateScriptNode(node, { url, mappings }) {
+  const newUrl = attemptRemap({ url, mappings });
+  if (url.toString() === newUrl.toString()) return;
+  const newNode = document.createElement(node.tagName);
+  newNode.innerHTML = node.innerHTML;
+  for (const attr of node.attributes) {
+    newNode.setAttribute(attr.name, attr.value);
+  }
+  newNode.setAttribute("src", attemptRemap({ url, mappings }).toString());
+  node.after(newNode);
+  node.remove();
+}
+
+function attemptSetNodeSrc(node, mappings) {
+  if (!(node instanceof HTMLElement) || !node.hasAttribute("src")) return;
+  const rawSrc = node.getAttribute("src");
+  const url = absoluteURL(rawSrc ?? "");
+  if (url.host === location.host) return;
+  if (node.tagName.toLowerCase() === "script") {
+    attemptRecreateScriptNode(node, { url, mappings });
+    return;
+  }
+  const newSrc = attemptRemap({ url, mappings }).toString();
+  if (newSrc !== rawSrc) node.setAttribute("src", newSrc);
+}
+
+function recursivelyRemapChildNodes(node, mappings) {
+  if (!node.hasChildNodes()) return;
+  node.childNodes.forEach((child) => {
+    attemptSetNodeSrc(child, mappings);
+    recursivelyRemapChildNodes(child, mappings);
+  });
+}
+
+/** Reescreve fetch/WebSocket/XHR para rotas mapeadas no Developer Portal. */
+export function patchUrlMappings(
+  mappings,
+  { patchFetch = true, patchWebSocket = true, patchXhr = true, patchSrcAttributes = false } = {}
+) {
+  if (typeof window === "undefined") return;
+
+  if (patchFetch) {
+    const fetchImpl = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      if (input instanceof Request) {
+        const newUrl = attemptRemap({ url: absoluteURL(input.url), mappings });
+        const newInit = { ...(init ?? {}) };
+        return input.blob().then((blob) => {
+          if (
+            input.method.toUpperCase() !== "HEAD" &&
+            input.method.toUpperCase() !== "GET" &&
+            blob.size > 0
+          ) {
+            newInit.body = blob;
+          }
+          return fetchImpl(new Request(newUrl, { ...newInit, method: input.method, headers: input.headers }));
+        });
+      }
+      const remapped = attemptRemap({
+        url: input instanceof URL ? input : absoluteURL(input),
+        mappings,
+      });
+      return fetchImpl(remapped, init);
+    };
+  }
+
+  if (patchWebSocket) {
+    class WebSocketProxy extends WebSocket {
+      constructor(url, protocols) {
+        const remapped = attemptRemap({
+          url: url instanceof URL ? url : absoluteURL(url),
+          mappings,
+        });
+        super(remapped, protocols);
+      }
+    }
+    window.WebSocket = WebSocketProxy;
+  }
+
+  if (patchXhr) {
+    const openImpl = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url, async, username, password) {
+      const remapped = attemptRemap({ url: absoluteURL(url), mappings });
+      openImpl.call(this, method, remapped.toString(), async, username, password);
+    };
+  }
+
+  if (patchSrcAttributes) {
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        if (mutation.type === "attributes" && mutation.attributeName === "src") {
+          attemptSetNodeSrc(mutation.target, mappings);
+        } else if (mutation.type === "childList") {
+          mutation.addedNodes.forEach((node) => {
+            attemptSetNodeSrc(node, mappings);
+            recursivelyRemapChildNodes(node, mappings);
+          });
+        }
+      }
+    });
+    observer.observe(document, { attributeFilter: ["src"], childList: true, subtree: true });
+    document.querySelectorAll("[src]").forEach((node) => attemptSetNodeSrc(node, mappings));
+  }
+}
 
 function uuid() {
   if (crypto.randomUUID) return crypto.randomUUID();

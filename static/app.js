@@ -44,15 +44,36 @@ function currentPreset() {
   return PRESETS[els.quality.value] || PRESETS.ultra;
 }
 
+function inDiscordActivity() {
+  return (
+    location.hostname.endsWith(".discordsays.com") ||
+    new URLSearchParams(location.search).has("frame_id")
+  );
+}
+
+async function activityFetch(path, init) {
+  const attempts = inDiscordActivity()
+    ? [`/.proxy${path}`, path]
+    : [path, `/.proxy${path}`];
+  for (const url of attempts) {
+    try {
+      const res = await fetch(url, init);
+      if (res.ok) return res;
+    } catch {}
+  }
+  return fetch(attempts[0], init);
+}
+
 async function loadConfig() {
-  const res = await fetch("/api/activity/config");
+  const res = await activityFetch("/api/activity/config");
   if (!res.ok) throw new Error("Activity sem DISCORD_CLIENT_ID no servidor");
   return res.json();
 }
 
 async function setupDiscord(clientId) {
   const params = new URLSearchParams(window.location.search);
-  const inDiscord = params.has("frame_id") && params.has("instance_id");
+  const inDiscord =
+    inDiscordActivity() && params.has("frame_id") && params.has("instance_id");
 
   if (!inDiscord) {
     els.title.textContent = "Modo demo local";
@@ -77,20 +98,11 @@ async function setupDiscord(clientId) {
   const code = authz.code || authz?.data?.code;
   if (!code) throw new Error("Authorize não retornou code");
 
-  // Preferir proxy do Discord; fallback mesma origem (browser).
-  let tokenRes = await fetch("/.proxy/api/activity/token", {
+  const tokenRes = await activityFetch("/api/activity/token", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ code }),
-  }).catch(() => null);
-
-  if (!tokenRes || !tokenRes.ok) {
-    tokenRes = await fetch("/api/activity/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
-    });
-  }
+  });
 
   if (!tokenRes.ok) {
     const err = await tokenRes.json().catch(() => ({}));
@@ -111,8 +123,8 @@ async function setupDiscord(clientId) {
 
 function wsUrl() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  // Dentro do Discord, o proxy usa o mesmo host da Activity.
-  return `${proto}//${location.host}/ws/share?room=${encodeURIComponent(roomId)}`;
+  const prefix = inDiscordActivity() ? "/.proxy" : "";
+  return `${proto}//${location.host}${prefix}/ws/share?room=${encodeURIComponent(roomId)}`;
 }
 
 function connectWs() {
@@ -408,7 +420,7 @@ els.mainBtn.addEventListener("click", async () => {
     setStatus(e.message || String(e));
     // Ainda permite demo local se config falhar parcialmente
     els.mainBtn.disabled = false;
-    els.mainBtn.textContent = "Transmitir tela (demo)";
+    els.mainBtn.textContent = "Transmitir tela";
     connectWs();
   }
 })();
