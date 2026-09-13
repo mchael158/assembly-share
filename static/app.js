@@ -20,6 +20,7 @@ const els = {
   view: document.getElementById("view"),
   mainBtn: document.getElementById("mainBtn"),
   quality: document.getElementById("quality"),
+  publishHint: document.getElementById("publishHint"),
 };
 
 let discordSdk = null;
@@ -204,8 +205,19 @@ async function setupDiscord(clientId) {
       publishKey = keyParam && keyParam !== "null" ? keyParam : null;
       els.title.textContent = "Transmissor Assembly Share";
       if (!publishKey || roomId === "local-demo") {
-        setStatus("Link inválido. Feche esta aba, reabra a Activity no Discord e use o botão de transmitir.");
-        els.mainBtn.disabled = true;
+        els.title.textContent = "Link antigo — não transmite";
+        setStatus("Esta URL (local-demo / key=null) não é o transmissor. Feche a aba, volte ao Discord e clique em Transmitir tela na Activity.");
+        els.mainBtn.disabled = false;
+        els.mainBtn.textContent = "Entendi, fechar esta página";
+        els.mainBtn.onclick = () => {
+          try { window.close(); } catch {}
+          location.href = PUBLISHER_ORIGIN;
+        };
+        if (els.publishHint) {
+          els.publishHint.hidden = false;
+          els.publishHint.textContent =
+            "O transmissor só abre pelo botão da Activity. A URL correta começa com mchael158.github.io/assembly-share/?room=…&key=…";
+        }
         return;
       }
       setStatus("Clique abaixo e escolha o que transmitir (tela, janela ou aba).");
@@ -265,13 +277,25 @@ async function openExternalPublisher() {
     return;
   }
   const url = publisherUrl();
-  setStatus("Abrindo o transmissor no navegador… escolha lá o que transmitir. O vídeo aparece aqui.");
-  try {
-    await discordSdk.commands.openExternalLink({ url });
-  } catch (e) {
-    console.warn(e);
-    setStatus(`Não abriu automaticamente. Copie e abra no navegador: ${url}`);
+  if (els.publishHint) {
+    els.publishHint.hidden = false;
+    els.publishHint.innerHTML = `Abra no Chrome/Edge:<br><a href="${url}" target="_blank" rel="noopener">${url}</a>`;
   }
+  setStatus("Abrindo o transmissor no navegador… se não abrir, use o link abaixo.");
+  try {
+    await navigator.clipboard.writeText(url);
+  } catch {}
+  if (discordSdk?.commands?.openExternalLink) {
+    try {
+      await discordSdk.commands.openExternalLink({ url });
+      return;
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+  try {
+    window.open(url, "_blank", "noopener");
+  } catch {}
 }
 
 function wsUrl() {
