@@ -25,6 +25,7 @@ export class DiscordSDK {
     this.isReady = false;
     this.pending = new Map();
     this.readyWaiters = [];
+    this.closeInfo = null;
 
     const params = new URLSearchParams(window.location.search);
     this.frameId = params.get("frame_id");
@@ -37,13 +38,14 @@ export class DiscordSDK {
       throw new Error("Abra pelo foguete do Discord (faltam frame_id/instance_id).");
     }
 
-    this.source = window.parent;
-    this.targetOrigin = "*";
+    this.source = window.parent.opener ?? window.parent;
+    this.targetOrigin = document.referrer ? new URL(document.referrer).origin : "*";
 
     window.addEventListener("message", this.#onMessage);
     this.commands = {
       authorize: (args) => this.#command("AUTHORIZE", args),
       authenticate: (args) => this.#command("AUTHENTICATE", args),
+      openExternalLink: (args) => this.#command("OPEN_EXTERNAL_LINK", args),
     };
 
     this.#send([
@@ -58,13 +60,31 @@ export class DiscordSDK {
     ]);
   }
 
-  ready() {
+  ready(timeoutMs = 10_000) {
     if (this.isReady) return Promise.resolve();
-    return new Promise((resolve) => this.readyWaiters.push(resolve));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(
+          new Error(
+            this.closeInfo
+              ? `Discord fechou a conexão: ${this.closeInfo}`
+              : "Discord não respondeu ao handshake. Feche e reabra a Activity."
+          )
+        );
+      }, timeoutMs);
+      this.readyWaiters.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   #send(payload) {
-    this.source.postMessage(payload, this.targetOrigin);
+    try {
+      this.source.postMessage(payload, this.targetOrigin);
+    } catch {
+      this.source.postMessage(payload, "*");
+    }
   }
 
   #command(cmd, args = {}) {
@@ -83,6 +103,8 @@ export class DiscordSDK {
 
     if (opcode === Opcodes.FRAME) {
       this.#onFrame(data);
+    } else if (opcode === Opcodes.CLOSE) {
+      this.closeInfo = data?.message || `code ${data?.code ?? "?"}`;
     }
   };
 
@@ -99,7 +121,8 @@ export class DiscordSDK {
     if (payload.evt === "ERROR" && payload.nonce) {
       const pending = this.pending.get(payload.nonce);
       if (pending) {
-        pending.reject(payload.data || new Error("SDK error"));
+        const msg = payload.data?.message || payload.data?.code || "SDK error";
+        pending.reject(new Error(String(msg)));
         this.pending.delete(payload.nonce);
       }
       return;

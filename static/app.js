@@ -25,6 +25,12 @@ let discordSdk = null;
 let auth = null;
 let ws = null;
 let roomId = "local-demo";
+let publishKey = null;
+// "activity" (dentro do Discord, só assiste e abre o transmissor externo)
+// "publisher" (aba do navegador aberta pela Activity, captura e envia)
+// "demo" (fora do Discord, tudo local)
+let mode = "demo";
+let roomLive = false;
 let publishing = false;
 let mediaStream = null;
 let videoTrack = null;
@@ -126,12 +132,59 @@ async function loadConfig() {
   return res.json();
 }
 
+function publisherUrl() {
+  const u = new URL(`https://${BACKEND_HOST}/`);
+  u.searchParams.set("room", roomId);
+  u.searchParams.set("key", publishKey);
+  return u.toString();
+}
+
+function getOrCreatePublishKey() {
+  const storageKey = `assembly-share:key:${roomId}`;
+  let key = null;
+  try {
+    key = sessionStorage.getItem(storageKey);
+  } catch {}
+  if (!key) {
+    key = crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2);
+    try {
+      sessionStorage.setItem(storageKey, key);
+    } catch {}
+  }
+  return key;
+}
+
+function refreshActivityButton() {
+  if (mode !== "activity") return;
+  if (roomLive) {
+    els.mainBtn.disabled = true;
+    els.mainBtn.textContent = "AO VIVO · pare pela aba do navegador";
+  } else {
+    els.mainBtn.disabled = false;
+    els.mainBtn.textContent = "Transmitir tela (abre no navegador)";
+  }
+}
+
 async function setupDiscord(clientId) {
   const params = new URLSearchParams(window.location.search);
   const inDiscord =
     inDiscordActivity() && params.has("frame_id") && params.has("instance_id");
 
   if (!inDiscord) {
+    const roomParam = params.get("room");
+    if (roomParam) {
+      mode = "publisher";
+      roomId = roomParam;
+      publishKey = params.get("key");
+      els.title.textContent = "Transmissor Assembly Share";
+      setStatus("Clique abaixo e escolha o que transmitir (tela, janela ou aba).");
+      els.mainBtn.disabled = false;
+      els.mainBtn.textContent = "Escolher o que transmitir";
+      connectWs();
+      return;
+    }
+
+    mode = "demo";
     els.title.textContent = "Modo demo local";
     roomId = "demo-local";
     setStatus("Pronto para testar fora do Discord");
@@ -141,9 +194,12 @@ async function setupDiscord(clientId) {
     return;
   }
 
+  mode = "activity";
+  setStatus("Conectando ao Discord…");
   discordSdk = new DiscordSDK(clientId);
   await discordSdk.ready();
 
+  setStatus("Autorize o Assembly na janela do Discord, se aparecer…");
   const authz = await discordSdk.commands.authorize({
     client_id: clientId,
     response_type: "code",
@@ -154,6 +210,7 @@ async function setupDiscord(clientId) {
   const code = authz.code || authz?.data?.code;
   if (!code) throw new Error("Authorize não retornou code");
 
+  setStatus("Validando sessão…");
   const tokenRes = await activityFetch("/api/activity/token", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -166,11 +223,22 @@ async function setupDiscord(clientId) {
   const channelId = discordSdk.channelId || "unknown";
   const guildId = discordSdk.guildId || "dm";
   roomId = `${guildId}:${channelId}`;
+  publishKey = getOrCreatePublishKey();
   els.title.textContent = "Assembly Share";
-  setStatus("Conectado. Um toque para transmitir.");
-  els.mainBtn.disabled = false;
-  els.mainBtn.textContent = "Transmitir tela";
+  setStatus("Conectando à sala…");
   connectWs();
+  refreshActivityButton();
+}
+
+async function openExternalPublisher() {
+  const url = publisherUrl();
+  setStatus("Abrindo o transmissor no navegador… escolha lá o que transmitir. O vídeo aparece aqui.");
+  try {
+    await discordSdk.commands.openExternalLink({ url });
+  } catch (e) {
+    console.warn(e);
+    setStatus(`Não abriu automaticamente. Copie e abra no navegador: ${url}`);
+  }
 }
 
 function wsUrl() {
@@ -184,7 +252,12 @@ function connectWs() {
   ws = new WebSocket(wsUrl());
   ws.binaryType = "arraybuffer";
 
-  ws.onopen = () => setMeta(`Sala ${roomId}`);
+  ws.onopen = () => {
+    setMeta(`Sala ${roomId}`);
+    if (mode === "activity" && publishKey) {
+      sendJson({ t: "claim", key: publishKey });
+    }
+  };
   ws.onclose = () => {
     setMeta("Reconectando…");
     setTimeout(connectWs, 1200);
@@ -193,9 +266,15 @@ function connectWs() {
     if (typeof ev.data === "string") {
       const msg = JSON.parse(ev.data);
       if (msg.t === "roster") {
+        roomLive = !!msg.live;
         setMeta(`${msg.live ? "AO VIVO" : "Aguardando"} · ${msg.viewers} na sala`);
+        refreshActivityButton();
         if (!publishing && !msg.live) {
-          setStatus("Ninguém transmitindo. Toque para começar.");
+          setStatus(
+            mode === "activity"
+              ? "Ninguém transmitindo. Toque no botão para abrir o transmissor."
+              : "Ninguém transmitindo. Toque para começar."
+          );
           els.preview.hidden = true;
           els.remote.hidden = true;
           els.view.hidden = true;
@@ -360,7 +439,7 @@ async function startWebCodecsPublish(cfg) {
   if (cfg.avc) encConfig.avc = cfg.avc;
 
   await encoder.configure(encConfig);
-  sendJson({ t: "publish" });
+  sendJson({ t: "publish", key: publishKey });
 
   const interval = Math.max(16, Math.floor(1000 / cfg.framerate));
   let frameNo = 0;
@@ -437,7 +516,7 @@ async function startMediaRecorderPublish(preset) {
     codedWidth: preset.width,
     codedHeight: preset.height,
   });
-  sendJson({ t: "publish" });
+  sendJson({ t: "publish", key: publishKey });
 
   mediaRecorder.ondataavailable = async (ev) => {
     if (!ev.data || ev.data.size === 0) return;
@@ -663,6 +742,10 @@ function base64ToBuffer(b64) {
 
 els.mainBtn.addEventListener("click", async () => {
   try {
+    if (mode === "activity") {
+      await openExternalPublisher();
+      return;
+    }
     if (publishing) await stopPublish();
     else await startPublish();
   } catch (e) {
