@@ -67,7 +67,7 @@ h1 {
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
 }
 
-video, canvas {
+video, canvas, #remoteJpeg {
   width: 100%;
   height: 100%;
   object-fit: contain;

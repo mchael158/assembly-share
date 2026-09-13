@@ -17,6 +17,7 @@ const els = {
   overlay: document.getElementById("overlay"),
   preview: document.getElementById("preview"),
   remote: document.getElementById("remote"),
+  remoteJpeg: document.getElementById("remoteJpeg"),
   view: document.getElementById("view"),
   mainBtn: document.getElementById("mainBtn"),
   quality: document.getElementById("quality"),
@@ -358,9 +359,12 @@ function connectWs() {
           );
           els.preview.hidden = true;
           els.remote.hidden = true;
+          if (els.remoteJpeg) els.remoteJpeg.hidden = true;
           els.view.hidden = true;
           els.overlay.classList.remove("hidden");
         }
+      } else if (msg.t === "jpeg" && !publishing) {
+        showJpegFrame(msg.data);
       } else if (msg.t === "config" && !publishing) {
         await ensureViewer(msg);
         await flushPendingPackets();
@@ -655,6 +659,10 @@ function teardownViewer() {
     try { URL.revokeObjectURL(lastJpegUrl); } catch {}
     lastJpegUrl = null;
   }
+  if (els.remoteJpeg) {
+    els.remoteJpeg.removeAttribute("src");
+    els.remoteJpeg.hidden = true;
+  }
   if (els.remote.src) {
     try {
       URL.revokeObjectURL(els.remote.src);
@@ -785,37 +793,55 @@ async function ensureWebCodecsViewer(cfg) {
   setStatus("Recebendo stream…", true);
 }
 
+function showJpegFrame(b64) {
+  if (!b64 || publishing) return;
+  const url = `data:image/jpeg;base64,${b64}`;
+  if (els.remoteJpeg) {
+    els.preview.hidden = true;
+    els.remote.hidden = true;
+    els.view.hidden = true;
+    els.remoteJpeg.hidden = false;
+    els.remoteJpeg.src = url;
+  } else {
+    const img = new Image();
+    img.onload = () => {
+      ensureJpegCanvas(img.naturalWidth, img.naturalHeight);
+      const vctx = els.view.getContext("2d", { alpha: false, desynchronized: true });
+      vctx.drawImage(img, 0, 0, els.view.width, els.view.height);
+    };
+    img.src = url;
+  }
+  els.overlay.classList.add("hidden");
+  viewerReady = true;
+}
+
 function startJpegFallback(srcW, srcH) {
   if (jpegTimer) clearInterval(jpegTimer);
-  const w = Math.min(srcW || 1280, 1280);
-  const h = Math.min(srcH || 720, 720);
+  const w = Math.min(srcW || 960, 960);
+  const h = Math.min(srcH || 540, 540);
   const jpegCanvas = document.createElement("canvas");
   jpegCanvas.width = w;
   jpegCanvas.height = h;
   const jctx = jpegCanvas.getContext("2d", { alpha: false, desynchronized: true });
+  sendJson({
+    t: "config",
+    mode: "jpeg",
+    codedWidth: w,
+    codedHeight: h,
+    key: publishKey,
+  });
 
   jpegTimer = setInterval(() => {
     if (!publishing || !els.preview || els.preview.readyState < 2) return;
     if (ws?.readyState !== WebSocket.OPEN) return;
     try {
       jctx.drawImage(els.preview, 0, 0, w, h);
-      jpegCanvas.toBlob(
-        async (blob) => {
-          if (!blob || ws?.readyState !== WebSocket.OPEN) return;
-          const ab = await blob.arrayBuffer();
-          const buf = new ArrayBuffer(1 + ab.byteLength);
-          const out = new Uint8Array(buf);
-          out[0] = PACKET_JPEG;
-          out.set(new Uint8Array(ab), 1);
-          ws.send(buf);
-        },
-        "image/jpeg",
-        0.62
-      );
+      const data = jpegCanvas.toDataURL("image/jpeg", 0.55).split(",")[1];
+      if (data) sendJson({ t: "jpeg", data });
     } catch (e) {
       console.warn(e);
     }
-  }, 120);
+  }, 140);
 }
 
 async function handleJpegPacket(buffer) {
