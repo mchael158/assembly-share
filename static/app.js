@@ -110,7 +110,14 @@ async function activityFetch(path, init) {
     try {
       const res = await fetch(url, init);
       if (res.ok) return res;
-      lastErr = new Error(`HTTP ${res.status} em ${url}`);
+      let detail = "";
+      try {
+        const body = await res.clone().json();
+        detail = body?.error ? ` — ${body.error}` : "";
+      } catch {}
+      lastErr = new Error(`HTTP ${res.status} em ${url}${detail}`);
+      // Erro do servidor com resposta válida: não adianta tentar outro caminho.
+      if (res.status >= 400 && res.status < 500 && res.status !== 404) break;
     } catch (e) {
       lastErr = e;
     }
@@ -132,10 +139,14 @@ async function loadConfig() {
   return res.json();
 }
 
+// Página do transmissor externo: hospedada no GitHub Pages (evita bloqueios de
+// antivírus no domínio compartilhado da Discloud). API/WS continuam na Discloud.
+const PUBLISHER_ORIGIN = "https://mchael158.github.io/assembly-share/";
+
 function publisherUrl() {
-  const u = new URL(`https://${BACKEND_HOST}/`);
+  const u = new URL(PUBLISHER_ORIGIN);
   u.searchParams.set("room", roomId);
-  u.searchParams.set("key", publishKey);
+  u.searchParams.set("key", publishKey || "");
   return u.toString();
 }
 
@@ -231,6 +242,12 @@ async function setupDiscord(clientId) {
 }
 
 async function openExternalPublisher() {
+  if (!publishKey || roomId === "local-demo") {
+    setStatus("A conexão com o Discord não foi concluída. Toque em Tentar novamente.");
+    els.mainBtn.textContent = "Tentar novamente";
+    els.mainBtn.onclick = () => location.reload();
+    return;
+  }
   const url = publisherUrl();
   setStatus("Abrindo o transmissor no navegador… escolha lá o que transmitir. O vídeo aparece aqui.");
   try {
@@ -765,7 +782,14 @@ els.mainBtn.addEventListener("click", async () => {
   } catch (e) {
     console.error(e);
     els.title.textContent = "Assembly Share";
-    setStatus(e.message || String(e));
+    setStatus(`Erro: ${e.message || String(e)}`);
+    if (mode === "activity") {
+      // Dentro do Discord não há fallback: mostrar o erro e oferecer recarregar.
+      els.mainBtn.disabled = false;
+      els.mainBtn.textContent = "Tentar novamente";
+      els.mainBtn.onclick = () => location.reload();
+      return;
+    }
     els.mainBtn.disabled = false;
     els.mainBtn.textContent = "Transmitir tela";
     connectWs();
